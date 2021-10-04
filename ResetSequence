@@ -1,0 +1,102 @@
+ PROCEDURE RESET_SEQUENCE_BY_MAXID(P_SequenceName VARCHAR2, P_TablesList VARCHAR2)
+  AS
+  v_AdjustSeq     INT;
+  v_NextSeq       INT;
+  v_DotPosition   INT;
+  v_sql           VARCHAR2(1000);
+  v_TableName     VARCHAR2(30);
+  v_Owner         VARCHAR2(30);
+  v_maxTableValue INT;
+  v_maxValue      INT;
+  v_primaryKey    VARCHAR2(30);
+  BEGIN
+   --obtain latest sequence value
+   BEGIN
+       v_sql := 'SELECT ' || UPPER(P_SequenceName) || '.NextVal FROM DUAL';
+       EXECUTE IMMEDIATE  v_sql INTO v_NextSeq;
+   EXCEPTION
+     WHEN OTHERS THEN
+        RAISE_APPLICATION_ERROR (-20101, 'Unable to obtain Sequence ' || P_SequenceName || ' ' || v_sql);
+   END;
+
+   v_maxTableValue := 0;
+   FOR l_rec IN(SELECT UPPER(STRVALUE) AS TabName  
+                FROM TABLE(TTS_CONFIGURATION.PKG_ADM_UTILS.STRINGLIST_TO_TABLE(P_TablesList)))
+   LOOP
+     v_DotPosition := INSTR(l_rec.TabName, '.');
+     IF v_DotPosition > 0 THEN
+        v_Owner := SUBSTR(l_rec.TabName, 1, v_DotPosition - 1);
+        v_TableName := SUBSTR(l_rec.TabName, (v_DotPosition + 1), 30);
+     ELSE 
+        v_TableName := l_rec.TabName;
+        v_Owner := 'TTS_CONFIGURATION'; -- or USER
+     END IF;
+
+     --obtain primary key.
+     BEGIN
+       SELECT UCC.COLUMN_NAME
+       INTO v_primaryKey
+       FROM ALL_constraints UC
+       JOIN ALL_CONS_COLUMNS UCC ON UCC.CONSTRAINT_NAME = UC.CONSTRAINT_NAME AND UCC.OWNER = UC.OWNER
+       WHERE UC.TABLE_NAME = v_TableName AND UC.OWNER = v_Owner AND UC.constraint_type = 'P';
+
+     EXCEPTION
+       WHEN OTHERS THEN
+        RAISE_APPLICATION_ERROR(-20101, 'Unable to obtain primary key ' || l_rec.TabName);
+     END;
+     --get the max value in the table
+     BEGIN
+      v_sql := 'SELECT COALESCE(MAX(' || v_primaryKey || '),0) FROM ' || l_rec.TabName;
+      EXECUTE IMMEDIATE v_sql INTO v_maxValue;
+      IF v_maxTableValue < v_maxValue THEN
+         v_maxTableValue := v_maxValue;
+      END IF;
+
+     EXCEPTION
+       WHEN OTHERS THEN
+        RAISE_APPLICATION_ERROR(-20101, 'Unable to obtain max value ' || v_sql);
+     END;
+   END LOOP;
+
+   -- Adjust the sequence
+   BEGIN
+      v_AdjustSeq := v_maxTableValue - v_NextSeq;
+      IF v_AdjustSeq != 0 AND v_maxTableValue != 0 THEN
+        v_sql := 'ALTER SEQUENCE ' || P_SequenceName || ' INCREMENT BY ' || v_AdjustSeq;
+        EXECUTE IMMEDIATE v_sql;
+      END IF;
+   EXCEPTION
+     WHEN OTHERS THEN
+        RAISE_APPLICATION_ERROR(-20101, 'Unable to alter sequence ' || v_sql);
+   END;
+
+   -- Adjust the sequence
+   BEGIN
+         IF v_AdjustSeq != 0 AND v_maxTableValue != 0 THEN
+               v_sql := 'SELECT ' || P_SequenceName || '.NextVal From Dual';
+               EXECUTE IMMEDIATE v_sql into v_NextSeq;
+          END IF;
+   EXCEPTION
+     WHEN OTHERS THEN
+        RAISE_APPLICATION_ERROR(-20101, 'Unable obtain adjusted value ' || v_sql);
+   END;
+
+   -- The code below tackles the tables without any data in them
+   BEGIN 
+        IF v_maxTableValue = 0 THEN
+           v_sql := 'DROP SEQUENCE ' || P_SequenceName;
+           EXECUTE IMMEDIATE v_sql;
+           v_sql := 'CREATE SEQUENCE ' || P_SequenceName || ' INCREMENT BY 1';
+           EXECUTE IMMEDIATE v_sql;
+        END IF;
+   END;
+
+   --back to incrementing by 1
+   BEGIN
+         v_sql := 'ALTER SEQUENCE ' || P_SequenceName || ' INCREMENT BY 1';
+      EXECUTE IMMEDIATE v_sql;
+   EXCEPTION
+     WHEN OTHERS THEN
+        raise_application_error(-20101, 'Unable to alter sequence increment ' || v_sql);
+   END;
+  END RESET_SEQUENCE_BY_MAXID;
