@@ -1,0 +1,210 @@
+CREATE OR REPLACE PACKAGE TTS_RECEIVE.PKG_TRANSFORM_XML_TO_TABLES IS
+
+    p_Xml xmlType;
+    p_XmlTransform xmlType; 
+    
+
+   procedure PUT_EXPORT_DECLARATION(pIdMessagesLog VARCHAR2,pRegXml in Xmltype,pTypeDoc VARCHAR2);
+    
+
+END PKG_TRANSFORM_XML_TO_TABLES;
+/
+
+CREATE OR REPLACE PACKAGE BODY TTS_RECEIVE.PKG_TRANSFORM_XML_TO_TABLES
+AS
+   PROCEDURE PUT_EXPORT_DECLARATION (pIdMessagesLog VARCHAR2,pRegXml IN XMLTYPE, pTypeDoc VARCHAR2)
+   IS
+      l_structure_id   INTEGER;
+
+      -- объявление типа
+      TYPE rec_dynamic_query IS RECORD
+      (
+         select_clause    LONG,
+         insert_clause    LONG,
+         select_fast_clause    LONG,
+         path_clause      VARCHAR2 (350),
+         columns_clause   CLOB,
+         table_name       VARCHAR2 (320)
+      );
+
+      dynamic_query    rec_dynamic_query;
+
+      TYPE rec_id_table IS RECORD
+      (
+         gd_declaration   CHAR (32 BYTE), -- идентификатор таблицы
+         second_lvl       CHAR (32 BYTE), --идентификатор для второго уровня таблиц дочерний по отношению к первому
+         third_lvl        CHAR (32 BYTE), -- идентификатор для третьего уровня таблиц дочерние по отношению к второму
+         fourth_lvl       CHAR (32 BYTE), -- идентификатор для четвертого уровня таблиц дочерние по отношению к третьем
+         fifth_lvl        CHAR (32 BYTE) -- идентификатор для четвертого уровня таблиц дочерние по отношению к четвертому
+      );
+
+      id_table         rec_id_table;
+
+      stmt             CLOB; -- сформированный sql-запрос. Тип Clob можно передавать в execute immediate
+      v_schema_name VARCHAR2(30 BYTE) := 'TTS_BUFFER';
+      PRAGMA AUTONOMOUS_TRANSACTION;
+   BEGIN
+      EXECUTE IMMEDIATE 'alter session set NLS_NUMERIC_CHARACTERS = ''.,''';
+      EXECUTE IMMEDIATE 'ALTER SESSION SET NLS_DATE_FORMAT = ''YYYY-MM-DD''';
+
+      -- РАБОЧИЙ КОД, ДЛЯ ВЫЗОВА ИЗ ПАКЕТА, ЗАКОММЕНТИРОВАЛИ ДЛЯ ТЕСТА НАПРЯМУЮ ПРЕОБРАЗОВАННОГО XML в функции
+      -- Получаем таблицу стилей xsl
+
+      SELECT XML
+        INTO p_XmlTransform
+        FROM TTS_RECEIVE.XML_STYLESHEET
+       WHERE 
+       -- DOCUMENTMODEID = pTypeDoc AND 
+            VERSION = '1.1.0';
+
+--      DBMS_OUTPUT.put_line ('Получаем таблицу стилей xsl: ');
+
+      -- Трансформируем входящую xml, согласно таблице стилей
+      SELECT XMLTRANSFORM (pRegXml, p_XmlTransform) INTO p_Xml FROM DUAL;
+
+--      DBMS_OUTPUT.put_line ('Трансформировали входящую xml, согласно таблице стилей ');
+
+      INSERT INTO XML_LOG (XML, VERSION,TYPE_DOC)
+           VALUES (
+                     p_Xml.getclobval,
+                     'ПРЕОБРАЗОВАННЫЙ ШАБЛОН',pTypeDoc);
+
+      COMMIT;
+
+      IF pTypeDoc IN ('DT','OT','BT','RT','UD','UZ','US','UP','ZP','TD','RS')
+      THEN
+         l_structure_id := 100;
+      END IF;
+
+      --p_Xml := pRegXml;
+
+      id_table.gd_declaration :=pIdMessagesLog; -- получаем id таблицы GD_DECLARATION
+
+-- 1. Нашли по иерархии выполнения, все таблицы декларации.
+        FOR array_table_name  IN (
+                                             SELECT ROWNUM ORDER_ROW,
+                   a.DSTRUCTURE_ID,a.PART_ID,a.PARENT_PART_ID,a.PART_NAME,a.PATH_XSLT, b.insert_clause, b.select_clause, b.columns_clause, b.select_fast_clause,
+                  REGEXP_COUNT(a.PATH_XSLT, '/')-1 LVL -- Уровень вложенности таблицы по отношению к родительской. GD_DECLARATION - 1. пока максимальный уровень 5 GD_SERIALS
+            FROM TTS_CONFIGURATION.GTD_PARTS a JOIN (
+            SELECT
+            part_id,
+            RTRIM(XMLAGG(XMLELEMENT (E,FIELD_NAME||',') ORDER BY FIELD_ID ASC).EXTRACT('//text()').getClobVal(),',') insert_clause,
+            RTRIM(XMLAGG(XMLELEMENT (E,COALESCE(WITH_PARAMETER,'')||FIELD_NAME||',') ORDER BY FIELD_ID ASC).EXTRACT('//text()').getClobVal(),',') select_clause,
+
+            DBMS_XMLGEN.CONVERT(RTRIM(XMLAGG(XMLELEMENT (E,
+                                                                                     CASE 
+                                                                                        WHEN WITH_PARAMETER IS NULL THEN COALESCE(WITH_PARAMETER,'')||'extractValue(value(t),''//'||FIELD_NAME||''') '||FIELD_NAME||','
+                                                                                          ELSE COALESCE(WITH_PARAMETER,'')||FIELD_NAME||','
+                                                                                     END
+                                                                                                     ) ORDER BY FIELD_ID ASC).EXTRACT('//text()').getClobVal(),','),1) select_fast_clause,
+                                                                                                     
+            DBMS_XMLGEN.CONVERT(XMLAGG(XMLELEMENT(E,
+                                                                                FIELD_NAME||' '||
+                                                                                   CASE FIELD_TYPE
+                                                                                      WHEN 'N' THEN 'NUMBER ('||FIELD_LENGTH||','||COALESCE (FIELD_SCALE,0)||')'
+                                                                                      WHEN 'C' THEN 'VARCHAR2 ('||FIELD_LENGTH||')'
+                                                                                      WHEN 'D' THEN 'DATE'
+                                                                                      ELSE 'X'
+                                                                                   END
+                                                                                ||' PATH '||''''||FIELD_NAME||''''||',') ORDER BY FIELD_ID ASC
+
+                                                        ).EXTRACT('//text()').getClobVal(),1) columns_clause FROM TTS_CONFIGURATION.ALL_FIELDS PART_ID<>'100307'                                                                                ) GROUP BY PART_ID
+                    ) b ON a.PART_ID = b.PART_ID
+                    WHERE DSTRUCTURE_ID=l_structure_id
+                    START WITH PARENT_PART_ID IS NULL
+                    CONNECT BY PRIOR a.PART_ID = a.PARENT_PART_ID
+               )
+            LOOP
+     --       DBMS_OUTPUT.put_line('RTRIM часть строки INSERT и SELECT select_clause.getClobVal() = '||array_table_name.insert_clause);
+            dynamic_query.insert_clause :=  array_table_name.insert_clause; -- long
+            dynamic_query.select_clause := array_table_name.select_clause; -- long
+            dynamic_query.path_clause := array_table_name.PATH_XSLT;
+            dynamic_query.select_fast_clause := array_table_name.select_fast_clause;
+      --         DBMS_OUTPUT.put_line('часть строки ПУТЬ в XSLT dynamic_query.path_clause = '||dynamic_query.path_clause);
+              dynamic_query.table_name := v_schema_name||'.'||array_table_name.PART_NAME;
+
+      --         DBMS_OUTPUT.put_line('dynamic_query.table_name '||array_table_name.PART_NAME);
+
+            dynamic_query.columns_clause := array_table_name.columns_clause;
+
+     --      DBMS_OUTPUT.put_line('DBMS_LOB.GETLENGTH(dynamic_query.columns_clause) = '|| DBMS_LOB.GETLENGTH(dynamic_query.columns_clause));
+     
+             DBMS_LOB.TRIM(dynamic_query.columns_clause, DBMS_LOB.GETLENGTH(dynamic_query.columns_clause)-1);
+             
+             IF dynamic_query.table_name <> v_schema_name||'.'||'GD_PRESENTEDDOCUMENT' THEN 
+              
+              stmt := 'INSERT INTO '||dynamic_query.table_name||' ('||dynamic_query.insert_clause||') '
+              ||' SELECT '||dynamic_query.select_clause||' FROM XMLTABLE ('||''''||dynamic_query.path_clause||''''||' PASSING :pXml COLUMNS '
+              ||dynamic_query.columns_clause||')';
+              
+              ELSE
+              stmt := 'INSERT INTO '||dynamic_query.table_name||' ('||dynamic_query.insert_clause||') '
+              ||' SELECT '||dynamic_query.select_fast_clause||' FROM TABLE (XMLSEQUENCE(EXTRACT(:pXml,'''||dynamic_query.path_clause||''') ) ) t';
+
+                     id_table.third_lvl := SYS_GUID();
+                     EXECUTE IMMEDIATE stmt USING  id_table.gd_declaration,
+                                                                      id_table.third_lvl,
+                                                                      p_Xml;
+             END IF;
+
+
+      --       DBMS_OUTPUT.put_line('***************************************'||CHR(10)||'Уровень вложенности таблицы '||dynamic_query.table_name||' = '||array_table_name.LVL);
+      --       DBMS_OUTPUT.put_line(LENGTH(stmt)||' stmt = '||stmt||CHR(13));
+
+                 IF (array_table_name.LVL=1) THEN
+                     EXECUTE IMMEDIATE stmt USING  id_table.gd_declaration,
+                                                                      p_Xml;
+                 ELSIF (array_table_name.LVL=2) THEN -- GD_GOODS (присвоение ID не несет смысловой нагрузки для этой таблицы) что бы не делать IF добавлено поле ID
+                     id_table.second_lvl := SYS_GUID();
+                     EXECUTE IMMEDIATE stmt USING  id_table.gd_declaration,
+                                                                      id_table.second_lvl,
+                                                                      p_Xml;
+                 ELSIF (array_table_name.LVL=3) THEN
+                  IF dynamic_query.table_name <> v_schema_name||'.'||'GD_PRESENTEDDOCUMENT' THEN 
+                     id_table.third_lvl := SYS_GUID();
+                     EXECUTE IMMEDIATE stmt USING  id_table.gd_declaration,
+                                                                      id_table.third_lvl,
+                                                                      p_Xml;
+                 END IF;
+                                                                      
+                 ELSIF (array_table_name.LVL=4) THEN
+                     id_table.fourth_lvl := SYS_GUID();
+                     EXECUTE IMMEDIATE stmt USING  id_table.gd_declaration, --1
+                                                                      id_table.third_lvl, --3
+                                                                      id_table.fourth_lvl, --4
+                                                                      p_Xml;
+                 ELSIF (array_table_name.LVL=5) THEN
+                     id_table.fifth_lvl := SYS_GUID();
+                     EXECUTE IMMEDIATE stmt USING  id_table.gd_declaration,
+                                                                      id_table.third_lvl,
+                                                                      id_table.fourth_lvl,
+                                                                      id_table.fifth_lvl,
+                                                                      p_Xml;
+                 END IF;
+              
+                 INSERT INTO TTS_RECEIVE.LOG_SD_MAIN (
+                        ID, VERSION, SIGNWORK,ERRORTEXT,KL, NAME_QUERY) 
+                 VALUES ( SYS_GUID(),
+                         CURRENT_TIMESTAMP,
+                         array_table_name.LVL,
+                         dynamic_query.table_name,
+                         array_table_name.ORDER_ROW,
+                        stmt);
+                        
+                 COMMIT;
+             
+            END LOOP;
+   EXCEPTION
+      WHEN OTHERS
+      THEN
+         raise_application_error (
+            -20001,
+            'Было выброшено исключение в процедуре PUT_EXPORT_DECLARATION: '
+            || TO_CHAR (SQLCODE)
+            || SUBSTR (SQLERRM, 1, 100)
+            || ' '
+            || DBMS_UTILITY.format_error_backtrace);
+   END PUT_EXPORT_DECLARATION;
+END PKG_TRANSFORM_XML_TO_TABLES;
+/
+
